@@ -2,40 +2,302 @@
 """
 Complete Production Chain Context System
 Integrates production chain calculation with context state management
+Enhanced with SFSSO queue, database persistence, and PI irrational rectification
 """
 
 import json
+import sqlite3
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
+from collections import deque
+from threading import Lock
 
 from production_chain_calculator import (
     ProductionChainCalculator, ProductionUnit, ProductionSystemType, ChainProduction
 )
 
 
+class DatabaseManager:
+    """Manages SQLite database for persistent state storage"""
+    
+    def __init__(self, db_path: str = "production_context.db"):
+        self.db_path = db_path
+        self.lock = Lock()
+        self._initialize_db()
+    
+    def _initialize_db(self):
+        """Initialize database schema"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_key TEXT UNIQUE NOT NULL,
+                    chain_id TEXT NOT NULL,
+                    context_state TEXT NOT NULL,
+                    prod_selection TEXT,
+                    chain_movement TEXT,
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS server_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chain_id TEXT NOT NULL,
+                    server_id TEXT NOT NULL,
+                    state_data TEXT NOT NULL,
+                    dependencies TEXT,
+                    served_order INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chain_id, server_id)
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS pi_calculations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chain_id TEXT NOT NULL,
+                    calculation_type TEXT NOT NULL,
+                    pi_value REAL NOT NULL,
+                    commodity_trial TEXT,
+                    irrational_rectification REAL,
+                    calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS access_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    action TEXT NOT NULL,
+                    chain_id TEXT,
+                    details TEXT
+                )
+            ''')
+            
+            conn.commit()
+    
+    def save_snapshot(self, snapshot_key: str, chain_id: str, context_state: Dict,
+                     prod_selection: str, chain_movement: str) -> bool:
+        """Save snapshot to database"""
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute('''
+                        INSERT INTO snapshots 
+                        (snapshot_key, chain_id, context_state, prod_selection, chain_movement)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (snapshot_key, chain_id, json.dumps(context_state), 
+                          prod_selection, chain_movement))
+                    conn.commit()
+                return True
+            except Exception as e:
+                print(f"Error saving snapshot: {e}")
+                return False
+    
+    def retrieve_snapshot(self, snapshot_key: str) -> Optional[Dict]:
+        """Retrieve snapshot from database"""
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.execute(
+                        'SELECT context_state FROM snapshots WHERE snapshot_key = ?',
+                        (snapshot_key,)
+                    )
+                    row = cursor.fetchone()
+                    return json.loads(row[0]) if row else None
+            except Exception as e:
+                print(f"Error retrieving snapshot: {e}")
+                return None
+    
+    def save_server_state(self, chain_id: str, server_id: str, state_data: Dict,
+                         dependencies: List[str], served_order: int) -> bool:
+        """Save server state with dependencies"""
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute('''
+                        INSERT OR REPLACE INTO server_states
+                        (chain_id, server_id, state_data, dependencies, served_order)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (chain_id, server_id, json.dumps(state_data),
+                          json.dumps(dependencies), served_order))
+                    conn.commit()
+                return True
+            except Exception as e:
+                print(f"Error saving server state: {e}")
+                return False
+    
+    def get_server_state(self, chain_id: str, server_id: str) -> Optional[Dict]:
+        """Retrieve server state"""
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.execute('''
+                        SELECT state_data, dependencies, served_order
+                        FROM server_states
+                        WHERE chain_id = ? AND server_id = ?
+                    ''', (chain_id, server_id))
+                    row = cursor.fetchone()
+                    if row:
+                        return {
+                            'state_data': json.loads(row[0]),
+                            'dependencies': json.loads(row[1]),
+                            'served_order': row[2]
+                        }
+                    return None
+            except Exception as e:
+                print(f"Error getting server state: {e}")
+                return None
+    
+    def save_pi_calculation(self, chain_id: str, calculation_type: str, pi_value: float,
+                           commodity_trial: str, irrational_rectification: float) -> bool:
+        """Save PI calculation result"""
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute('''
+                        INSERT INTO pi_calculations
+                        (chain_id, calculation_type, pi_value, commodity_trial, irrational_rectification)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (chain_id, calculation_type, pi_value, commodity_trial, irrational_rectification))
+                    conn.commit()
+                return True
+            except Exception as e:
+                print(f"Error saving PI calculation: {e}")
+                return False
+
+
+class SFSSQueueManager:
+    """Manages Served-First-Served-Out queue"""
+    
+    def __init__(self):
+        self.queue: Dict[str, deque] = {}
+        self.served_order: Dict[str, int] = {}
+        self.lock = Lock()
+    
+    def enqueue(self, chain_id: str, server_id: str, state_data: Dict) -> int:
+        """Enqueue server state, returns served order"""
+        with self.lock:
+            if chain_id not in self.queue:
+                self.queue[chain_id] = deque()
+                self.served_order[chain_id] = 0
+            
+            order = self.served_order[chain_id]
+            self.served_order[chain_id] += 1
+            
+            self.queue[chain_id].append({
+                'server_id': server_id,
+                'state_data': state_data,
+                'served_order': order,
+                'timestamp': datetime.utcnow().isoformat() + 'Z'
+            })
+            
+            return order
+    
+    def dequeue(self, chain_id: str) -> Optional[Dict]:
+        """Dequeue first served item (FIFO)"""
+        with self.lock:
+            if chain_id in self.queue and self.queue[chain_id]:
+                return self.queue[chain_id].popleft()
+            return None
+    
+    def get_queue_status(self, chain_id: str) -> Dict:
+        """Get queue status for chain"""
+        with self.lock:
+            if chain_id not in self.queue:
+                return {'queue_length': 0, 'served_count': 0}
+            
+            return {
+                'queue_length': len(self.queue[chain_id]),
+                'served_count': self.served_order[chain_id],
+                'current_order': self.served_order[chain_id]
+            }
+
+
+class PIRationalRectificationCalculator:
+    """Calculates PI with irrational rectification based on commodity trials"""
+    
+    @staticmethod
+    def calculate_irrational_rectification(base_value: float, commodity_trial_factor: float) -> float:
+        """
+        Calculate irrational rectification using mathematical irrationals
+        
+        Args:
+            base_value: Base calculation value
+            commodity_trial_factor: Commodity trial adjustment factor
+            
+        Returns:
+            Rectified PI value
+        """
+        # Base PI approximation
+        pi_base = math.pi
+        
+        # Golden ratio for commodity correction
+        phi = (1 + math.sqrt(5)) / 2
+        
+        # Euler's number adjustment
+        e_adjustment = math.e
+        
+        # Calculate irrational rectification
+        rectification = (
+            pi_base * commodity_trial_factor * 
+            math.log(phi + commodity_trial_factor) / 
+            math.sqrt(e_adjustment)
+        )
+        
+        return rectification
+    
+    @staticmethod
+    def rectify_pi_value(raw_pi: float, commodity_trial: str, trial_intensity: float = 1.0) -> Tuple[float, float]:
+        """
+        Rectify PI value through irrational transformation
+        
+        Args:
+            raw_pi: Raw PI value
+            commodity_trial: Type of commodity trial
+            trial_intensity: Intensity factor of trial
+            
+        Returns:
+            Tuple of (rectified_pi, irrational_rectification_factor)
+        """
+        # Commodity trial intensity mapping
+        trial_factors = {
+            'high': 1.8,
+            'medium': 1.2,
+            'low': 0.8,
+            'critical': 2.5
+        }
+        
+        factor = trial_factors.get(commodity_trial, 1.0)
+        effective_factor = factor * trial_intensity
+        
+        # Calculate rectification
+        irrational_rect = PIRationalRectificationCalculator.calculate_irrational_rectification(
+            raw_pi, effective_factor
+        )
+        
+        # Apply rectification to PI
+        rectified_pi = raw_pi + irrational_rect
+        
+        return rectified_pi, irrational_rect
+
+
 class PermanentContextBuffer:
     """Manages permanent storage and retrieval of context states"""
     
-    def __init__(self):
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
         self.buffer_store: Dict[str, Dict] = {}
         self.access_log: List[Dict] = []
-        self.snapshots: Dict[str, List[str]] = {}  # chain_id → [snapshot_keys]
+        self.snapshots: Dict[str, List[str]] = {}
     
     def save_snapshot(self, chain_id: str, context_state: Dict,
                      prod_selection: str = "all",
                      chain_movement: str = "forward") -> str:
-        """
-        Save a context snapshot with metadata
-        
-        Args:
-            chain_id: Chain identifier
-            context_state: Complete context state
-            prod_selection: Which prod systems selected
-            chain_movement: Direction of chain (forward/backward/branch)
-            
-        Returns:
-            Snapshot key for retrieval
-        """
+        """Save context snapshot with database persistence"""
         snapshot_key = f"{chain_id}_{datetime.utcnow().timestamp()}"
         
         snapshot = {
@@ -47,7 +309,11 @@ class PermanentContextBuffer:
             'context_state': context_state
         }
         
+        # Save to memory buffer
         self.buffer_store[snapshot_key] = snapshot
+        
+        # Save to database
+        self.db.save_snapshot(snapshot_key, chain_id, context_state, prod_selection, chain_movement)
         
         if chain_id not in self.snapshots:
             self.snapshots[chain_id] = []
@@ -64,14 +330,24 @@ class PermanentContextBuffer:
         return snapshot_key
     
     def retrieve_snapshot(self, snapshot_key: str) -> Optional[Dict]:
-        """Retrieve a specific snapshot"""
-        self.access_log.append({
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'action': 'retrieve',
-            'snapshot_key': snapshot_key
-        })
+        """Retrieve snapshot from buffer or database"""
+        # Try memory buffer first
+        if snapshot_key in self.buffer_store:
+            snapshot = self.buffer_store[snapshot_key]
+        else:
+            # Try database
+            snapshot = self.db.retrieve_snapshot(snapshot_key)
+            if snapshot:
+                self.buffer_store[snapshot_key] = snapshot
         
-        return self.buffer_store.get(snapshot_key)
+        if snapshot:
+            self.access_log.append({
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'action': 'retrieve',
+                'snapshot_key': snapshot_key
+            })
+        
+        return snapshot
     
     def get_chain_snapshots(self, chain_id: str) -> List[Dict]:
         """Get all snapshots for a chain"""
@@ -87,23 +363,12 @@ class PermanentContextBuffer:
     def reinstate_with_prod_selection(self, chain_id: str,
                                      prod_selection: str,
                                      restore_point: Optional[str] = None) -> Dict:
-        """
-        Reinstate context based on production selection
-        
-        Args:
-            chain_id: Chain identifier
-            prod_selection: Production systems to consider
-            restore_point: Specific snapshot to restore, or None for latest
-            
-        Returns:
-            Reinstated context with prod selection applied
-        """
+        """Reinstate context based on production selection"""
         snapshots = self.get_chain_snapshots(chain_id)
         
         if not snapshots:
             return {'error': f'No snapshots for chain {chain_id}'}
         
-        # Select restore point
         if restore_point:
             target_snapshot = next(
                 (s for s in snapshots if s['snapshot_key'] == restore_point),
@@ -112,9 +377,8 @@ class PermanentContextBuffer:
             if not target_snapshot:
                 return {'error': f'Snapshot {restore_point} not found'}
         else:
-            target_snapshot = snapshots[-1]  # Latest
+            target_snapshot = snapshots[-1]
         
-        # Apply prod selection filter
         if prod_selection != "all":
             filtered_state = self._filter_by_prod_selection(
                 target_snapshot['context_state'],
@@ -137,9 +401,7 @@ class PermanentContextBuffer:
         if prod_selection == "all":
             return context_state
         
-        # Parse selection (e.g., "ehr,monitoring,model")
         selected_systems = set(prod_selection.split(','))
-        
         filtered = context_state.copy()
         
         if 'production_systems_involved' in filtered:
@@ -162,40 +424,90 @@ class PermanentContextBuffer:
             }, f, indent=2)
 
 
+class ServerStateDependencyManager:
+    """Manages server state instantiation with dependency tracking"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+        self.sfsso_queue = SFSSQueueManager()
+        self.pi_calculator = PIRationalRectificationCalculator()
+        self.dependency_graph: Dict[str, List[str]] = {}
+        self.resolved_states: Dict[str, Dict] = {}
+    
+    def instantiate_server_state(self, chain_id: str, server_id: str, 
+                                state_data: Dict, dependencies: List[str]) -> Dict:
+        """Instantiate server state with dependency management"""
+        
+        # Resolve dependencies first
+        resolved_deps = self._resolve_dependencies(chain_id, dependencies)
+        
+        # Enqueue in SFSSO
+        served_order = self.sfsso_queue.enqueue(chain_id, server_id, state_data)
+        
+        # Create complete state with metadata
+        complete_state = {
+            'chain_id': chain_id,
+            'server_id': server_id,
+            'state_data': state_data,
+            'dependencies': dependencies,
+            'resolved_dependencies': resolved_deps,
+            'served_order': served_order,
+            'instantiated_at': datetime.utcnow().isoformat() + 'Z'
+        }
+        
+        # Save to database
+        self.db.save_server_state(chain_id, server_id, state_data, dependencies, served_order)
+        
+        # Store resolved state
+        self.resolved_states[f"{chain_id}:{server_id}"] = complete_state
+        
+        return complete_state
+    
+    def _resolve_dependencies(self, chain_id: str, dependencies: List[str]) -> Dict[str, Any]:
+        """Resolve dependency graph"""
+        resolved = {}
+        
+        for dep in dependencies:
+            if dep in self.resolved_states:
+                resolved[dep] = self.resolved_states[dep]
+            else:
+                resolved[dep] = {'status': 'pending', 'dependency': dep}
+        
+        return resolved
+    
+    def process_sfsso_queue(self, chain_id: str) -> List[Dict]:
+        """Process SFSSO queue and return processed items"""
+        processed = []
+        
+        while True:
+            item = self.sfsso_queue.dequeue(chain_id)
+            if not item:
+                break
+            processed.append(item)
+        
+        return processed
+
+
 class ProductionChainContextSystem:
     """
-    Complete system integrating:
-    - Production chain calculation
-    - Context state management
-    - Permanent buffer storage
-    - Prod selection and chain movement
+    Complete system with SFSSO, DB persistence, server-state instantiation, and PI rectification
     """
     
-    def __init__(self):
+    def __init__(self, db_path: str = "production_context.db"):
+        self.db = DatabaseManager(db_path)
         self.calculator = ProductionChainCalculator()
-        self.buffer = PermanentContextBuffer()
+        self.buffer = PermanentContextBuffer(self.db)
+        self.server_manager = ServerStateDependencyManager(self.db)
+        self.pi_calculator = PIRationalRectificationCalculator()
         self.operation_history: List[Dict] = []
-        self.context_snapshots: Dict[str, Dict] = {}  # active context states
+        self.context_snapshots: Dict[str, Dict] = {}
     
     def initialize_chain_from_prod(self, chain_id: str, user_id: str,
                                   prod_systems: List[Tuple[str, str]],
                                   base_thresholds: Dict[str, float]) -> Dict:
-        """
-        Initialize a chain from production systems
-        
-        Args:
-            chain_id: Chain identifier
-            user_id: User operating the chain
-            prod_systems: List of (system_id, system_type) tuples
-            base_thresholds: Base threshold values
-            
-        Returns:
-            Initialized chain context
-        """
-        # Create production chain
+        """Initialize chain from production systems"""
         chain = self.calculator.create_production_chain(chain_id, user_id)
         
-        # Register systems
         system_ids = []
         for system_id, system_type_str in prod_systems:
             system_type = ProductionSystemType[system_type_str.upper()]
@@ -203,14 +515,12 @@ class ProductionChainContextSystem:
             self.calculator.register_production_system(unit)
             system_ids.append(system_id)
         
-        # Calculate from production
         calculated = self.calculator.calculate_chain_from_production(
             chain_id=chain_id,
             production_unit_ids=system_ids,
             thresholds=base_thresholds
         )
         
-        # Create context snapshot
         init_context = {
             'chain_id': chain_id,
             'user_id': user_id,
@@ -222,7 +532,6 @@ class ProductionChainContextSystem:
         
         self.context_snapshots[chain_id] = init_context
         
-        # Save to permanent buffer
         snapshot_key = self.buffer.save_snapshot(
             chain_id=chain_id,
             context_state=init_context,
@@ -230,7 +539,6 @@ class ProductionChainContextSystem:
             chain_movement='initialization'
         )
         
-        # Log operation
         self.operation_history.append({
             'timestamp': datetime.utcnow().isoformat() + 'Z',
             'operation': 'initialize_chain',
@@ -240,27 +548,36 @@ class ProductionChainContextSystem:
         
         return init_context
     
+    def instantiate_server_states(self, chain_id: str, server_configs: List[Dict]) -> Dict:
+        """Instantiate server states with SFSSO and dependencies"""
+        results = []
+        
+        for config in server_configs:
+            server_id = config.get('server_id')
+            state_data = config.get('state_data', {})
+            dependencies = config.get('dependencies', [])
+            
+            result = self.server_manager.instantiate_server_state(
+                chain_id, server_id, state_data, dependencies
+            )
+            results.append(result)
+        
+        return {
+            'chain_id': chain_id,
+            'servers_instantiated': len(results),
+            'server_states': results,
+            'sfsso_queue_status': self.server_manager.sfsso_queue.get_queue_status(chain_id)
+        }
+    
     def process_model_response_in_chain(self, chain_id: str, 
                                        response_text: str,
                                        response_data: Dict,
                                        model_id: str = "default") -> Dict:
-        """
-        Process model response within a chain context
-        
-        Args:
-            chain_id: Chain identifier
-            response_text: Model response text
-            response_data: Structured response
-            model_id: Model identifier
-            
-        Returns:
-            Processing result with context update
-        """
+        """Process model response with PI rectification"""
         chain = self.calculator.chains.get(chain_id)
         if not chain:
             return {'error': f'Chain {chain_id} not found'}
         
-        # Record model response
         model_response = chain.record_model_response(
             response_text=response_text,
             response_data=response_data,
@@ -268,16 +585,28 @@ class ProductionChainContextSystem:
             confidence=0.85
         )
         
-        # Update context with model terminologies
+        # Calculate PI with irrational rectification
+        commodity_trial = response_data.get('commodity_trial', 'medium')
+        raw_pi = 3.14159
+        rectified_pi, irrational_rect = self.pi_calculator.rectify_pi_value(
+            raw_pi, commodity_trial, trial_intensity=1.0
+        )
+        
+        # Save PI calculation
+        self.db.save_pi_calculation(
+            chain_id, 'model_response', rectified_pi, commodity_trial, irrational_rect
+        )
+        
         if chain_id in self.context_snapshots:
             self.context_snapshots[chain_id]['model_response'] = {
                 'timestamp': model_response['timestamp'],
                 'model_id': model_response['model_id'],
+                'pi_rectified': rectified_pi,
+                'irrational_rectification': irrational_rect,
                 'text_to_class_terminologies': model_response['text_to_class_terminologies'],
                 'response_classes': self._extract_response_classes(response_data)
             }
         
-        # Save to buffer with model response context
         snapshot_key = self.buffer.save_snapshot(
             chain_id=chain_id,
             context_state=self.context_snapshots[chain_id],
@@ -285,20 +614,20 @@ class ProductionChainContextSystem:
             chain_movement='model_response'
         )
         
-        # Log operation
         self.operation_history.append({
             'timestamp': datetime.utcnow().isoformat() + 'Z',
             'operation': 'process_model_response',
             'chain_id': chain_id,
-            'model_id': model_id,
-            'terminologies_extracted': len(model_response['text_to_class_terminologies']),
+            'pi_rectified': rectified_pi,
+            'irrational_rectification': irrational_rect,
             'snapshot_key': snapshot_key
         })
         
         return {
             'chain_id': chain_id,
             'model_response_processed': True,
-            'terminologies': model_response['text_to_class_terminologies'],
+            'pi_rectified': rectified_pi,
+            'irrational_rectification': irrational_rect,
             'snapshot_key': snapshot_key
         }
     
@@ -315,155 +644,25 @@ class ProductionChainContextSystem:
         
         return classes
     
-    def inject_thresholds_and_restore_context(self, chain_id: str,
-                                             threshold_dependencies: Dict[str, float],
-                                             prod_selection: str = "all",
-                                             restore_point: Optional[str] = None) -> Dict:
-        """
-        Inject thresholds and restore full context state
+    def process_sfsso_results(self, chain_id: str) -> Dict:
+        """Process SFSSO queue results and return them"""
+        processed = self.server_manager.process_sfsso_queue(chain_id)
         
-        Args:
-            chain_id: Chain identifier
-            threshold_dependencies: Thresholds to inject
-            prod_selection: Production systems to consider
-            restore_point: Specific buffer snapshot
-            
-        Returns:
-            Restored context with injected thresholds
-        """
-        # Inject thresholds
-        injected = self.calculator.inject_threshold_dependencies(
-            chain_id=chain_id,
-            dependencies=threshold_dependencies
-        )
-        
-        # Reinstate from buffer with prod selection
-        reinstated = self.buffer.reinstate_with_prod_selection(
-            chain_id=chain_id,
-            prod_selection=prod_selection,
-            restore_point=restore_point
-        )
-        
-        # Combine into complete context
-        complete_context = {
+        return {
             'chain_id': chain_id,
-            'operation_time': datetime.utcnow().isoformat() + 'Z',
-            'injected_thresholds': threshold_dependencies,
-            'prod_selection': prod_selection,
-            'restored_from_buffer': reinstated,
-            'total_context_state': {
-                **injected['total_context_state'],
-                'injected_thresholds_applied': threshold_dependencies,
-                'prod_systems_active': len(reinstated['context_state'].get('production_systems', []))
-            }
+            'sfsso_processed_count': len(processed),
+            'processed_items': processed,
+            'processing_time': datetime.utcnow().isoformat() + 'Z'
         }
-        
-        # Update active context
-        self.context_snapshots[chain_id] = complete_context
-        
-        # Save to buffer
-        snapshot_key = self.buffer.save_snapshot(
-            chain_id=chain_id,
-            context_state=complete_context,
-            prod_selection=prod_selection,
-            chain_movement='threshold_injection'
-        )
-        
-        # Log operation
-        self.operation_history.append({
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'operation': 'inject_thresholds_restore',
-            'chain_id': chain_id,
-            'prod_selection': prod_selection,
-            'thresholds_injected': len(threshold_dependencies),
-            'snapshot_key': snapshot_key
-        })
-        
-        return complete_context
-    
-    def handle_chain_movement(self, chain_id: str, 
-                             movement_direction: str,
-                             target_prod_systems: Optional[List[str]] = None) -> Dict:
-        """
-        Handle chain movement (forward, backward, branch)
-        
-        Args:
-            chain_id: Chain identifier
-            movement_direction: 'forward', 'backward', or 'branch'
-            target_prod_systems: Systems to activate for this movement
-            
-        Returns:
-            Movement result with context update
-        """
-        if chain_id not in self.context_snapshots:
-            return {'error': f'Chain {chain_id} not found'}
-        
-        current_context = self.context_snapshots[chain_id]
-        
-        movement_result = {
-            'chain_id': chain_id,
-            'movement': movement_direction,
-            'movement_time': datetime.utcnow().isoformat() + 'Z',
-            'previous_context': current_context.copy(),
-            'updated_context': {}
-        }
-        
-        if movement_direction == 'forward':
-            # Continue with current systems
-            prod_selection = 'all'
-        elif movement_direction == 'backward':
-            # Restore from previous snapshot
-            snapshots = self.buffer.get_chain_snapshots(chain_id)
-            if len(snapshots) > 1:
-                previous = snapshots[-2]  # Second to last
-                restored = self.buffer.reinstate_with_prod_selection(
-                    chain_id, 'all', previous['snapshot_key']
-                )
-                current_context = restored['context_state']
-            prod_selection = 'all'
-        elif movement_direction == 'branch':
-            # Create new branch with selected systems
-            if target_prod_systems:
-                prod_selection = ','.join(target_prod_systems)
-            else:
-                prod_selection = 'all'
-        
-        movement_result['updated_context'] = current_context
-        movement_result['prod_selection_active'] = prod_selection
-        
-        self.context_snapshots[chain_id] = current_context
-        
-        # Save movement to buffer
-        snapshot_key = self.buffer.save_snapshot(
-            chain_id=chain_id,
-            context_state=movement_result['updated_context'],
-            prod_selection=prod_selection,
-            chain_movement=movement_direction
-        )
-        
-        # Log operation
-        self.operation_history.append({
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'operation': 'chain_movement',
-            'chain_id': chain_id,
-            'movement_direction': movement_direction,
-            'snapshot_key': snapshot_key
-        })
-        
-        return movement_result
     
     def export_complete_system(self, output_dir: str) -> None:
         """Export complete system state"""
         import os
         os.makedirs(output_dir, exist_ok=True)
         
-        # Export calculator buffers
         self.calculator.export_permanent_buffer(f"{output_dir}/calculator_buffer.json")
-        
-        # Export permanent buffer
         self.buffer.export_buffer(f"{output_dir}/context_buffer.json")
         
-        # Export operation history
         with open(f"{output_dir}/operation_history.json", 'w') as f:
             json.dump({
                 'exported_at': datetime.utcnow().isoformat() + 'Z',
@@ -471,7 +670,6 @@ class ProductionChainContextSystem:
                 'operations': self.operation_history
             }, f, indent=2)
         
-        # Export active context snapshots
         with open(f"{output_dir}/active_contexts.json", 'w') as f:
             json.dump({
                 'exported_at': datetime.utcnow().isoformat() + 'Z',
@@ -499,10 +697,7 @@ class ProductionChainContextSystem:
 if __name__ == "__main__":
     system = ProductionChainContextSystem()
     
-    print("=== Production Chain Context System Demo ===\n")
-    
-    # Initialize chain from production
-    print("1. Initializing chain from production systems...")
+    print("=== Production Chain Context System (Enhanced) ===\n")
     
     chain_id = "PROD-CONTEXT-CHAIN-001"
     prod_systems = [
@@ -512,6 +707,7 @@ if __name__ == "__main__":
         ("model-001", "MODEL_INFERENCE")
     ]
     
+    print("1. Initializing chain from production systems...")
     init_context = system.initialize_chain_from_prod(
         chain_id=chain_id,
         user_id="ER-PHYSICIAN-001",
@@ -524,57 +720,46 @@ if __name__ == "__main__":
     )
     
     print(f"✓ Chain initialized")
-    print(f"✓ Production systems: {init_context['production_systems']}")
     
-    # Process model response
-    print("\n2. Processing model response...")
+    print("\n2. Instantiating server states with SFSSO...")
+    server_configs = [
+        {
+            'server_id': 'server-001',
+            'state_data': {'status': 'active', 'capacity': 100},
+            'dependencies': []
+        },
+        {
+            'server_id': 'server-002',
+            'state_data': {'status': 'standby', 'capacity': 50},
+            'dependencies': ['server-001']
+        }
+    ]
     
+    server_result = system.instantiate_server_states(chain_id, server_configs)
+    print(f"✓ Servers instantiated: {server_result['servers_instantiated']}")
+    print(f"✓ SFSSO queue status: {server_result['sfsso_queue_status']}")
+    
+    print("\n3. Processing model response with PI rectification...")
     response = system.process_model_response_in_chain(
         chain_id=chain_id,
-        response_text="CRITICAL: Septic shock detected. Urgent ICU admission required.",
+        response_text="CRITICAL: Septic shock detected.",
         response_data={
-            'diagnosis': 'septic_shock','inference by old manual'
-            'severity': 'critical', 'safety reasoning'
-            'acuity': 'life_threatening','combat-off'
+            'diagnosis': 'septic_shock',
+            'severity': 'critical',
+            'commodity_trial': 'high'
         },
         model_id='clinical-ai-v2.1'
     )
     
-    print(f"✓ Model response processed",)
-    print(f"✓ Terminologies extracted: {len(response['terminologies'])}")
+    print(f"✓ Model response processed")
+    print(f"✓ PI rectified: {response['pi_rectified']:.6f}")
+    print(f"✓ Irrational rectification: {response['irrational_rectification']:.6f}")
     
-    # Inject thresholds and restore context
-    print("\n3. Injecting thresholds and restoring context...")
+    print("\n4. Processing SFSSO queue...")
+    sfsso_result = system.process_sfsso_results(chain_id)
+    print(f"✓ SFSSO items processed: {sfsso_result['sfsso_processed_count']}")
     
-    restored = system.inject_thresholds_and_restore_context(
-        chain_id=chain_id,
-        threshold_dependencies={
-            'icu_required': 1.0,
-            'chain-off' = True
-            'chain-dependency' = False
-            'emergency_protocol': 0.98,
-            'critical_monitoring': 0.99
-        },
-        prod_selection='all' , 'trivial' , 'base'
-    )
-    
-    print(f"✓ Thresholds injected")
-    print(f"✓ Context restored")
-    
-    
-    # Handle chain movement
-    print("\n4. Handling chain movement...")
-    
-    movement = system.handle_chain_movement(
-        chain_id=chain_id,
-        movement_direction='forward'
-    )
-    
-    print(f"✓ Chain moved: {movement['movement']}")
-    
-    # Print summary and export
     print("\n5. Exporting complete system...")
-    
     system.export_complete_system("results/production_context_system")
     system.print_system_summary()
     
