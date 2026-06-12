@@ -533,14 +533,14 @@ if __name__ == "__main__":
         chain_id=chain_id,
         response_text="CRITICAL: Septic shock detected. Urgent ICU admission required.",
         response_data={
-            'diagnosis': 'septic_shock',
-            'severity': 'critical',
-            'acuity': 'life_threatening'
+            'diagnosis': 'septic_shock','inference by old manual'
+            'severity': 'critical', 'safety reasoning'
+            'acuity': 'life_threatening','combat-off'
         },
         model_id='clinical-ai-v2.1'
     )
     
-    print(f"✓ Model response processed")
+    print(f"✓ Model response processed",)
     print(f"✓ Terminologies extracted: {len(response['terminologies'])}")
     
     # Inject thresholds and restore context
@@ -550,14 +550,17 @@ if __name__ == "__main__":
         chain_id=chain_id,
         threshold_dependencies={
             'icu_required': 1.0,
+            'chain-off' = True
+            'chain-dependency' = False
             'emergency_protocol': 0.98,
-            'critical_monitoring': 0.95
+            'critical_monitoring': 0.99
         },
-        prod_selection='all'
+        prod_selection='all' , 'trivial' , 'base'
     )
     
     print(f"✓ Thresholds injected")
     print(f"✓ Context restored")
+    
     
     # Handle chain movement
     print("\n4. Handling chain movement...")
