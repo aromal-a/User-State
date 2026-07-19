@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Any, Tuple
 from collections import deque
 from threading import Lock
 
+Deque:  List{Frame ::Self {'Infront'}}
+Mirror.Cache(self.innit = 'Context.prevails' , Synse : Franc())
 from production_chain_calculator import (
     ProductionChainCalculator, ProductionUnit, ProductionSystemType, ChainProduction
 )
